@@ -1,65 +1,265 @@
 const express = require('express');
+const https = require("https");
 const app = express();
 const port = process.env.PORT || 3000;
 const bodyParser = require('body-parser');
 const fetch = require('node-fetch');
-app.use(bodyParser());
+app.use(bodyParser())
+
+const slackApi = "https://slack.com/api"
+const risibankApi = "https://api.risibank.fr/api/v0"
 
 // Home
-app.get('/', (req, res) => res.send('Haha what are you looking for?'));
+app.get('/', async (req, res) => {
+    res.status(404).end();
+    res.send('Cheh');
+});
 
 // Endpoint that sends media to Slack
-app.post('/get-gif', async (req, res) => {
+app.post('/interact', async (req, res) => {
+    app.use(bodyParser.json({type: function() {return true;}
+      }));
     try {
-        const urls = getUrls();
-        const randomIndex = Math.floor(Math.random() * urls.length);
-        const url = urls[randomIndex];
+        console.log(req.body.payload);
+        const { type} = JSON.parse(req.body.payload);
 
-        /* Slack slash commands have an invocation structure that includes:
-            - response_url: a hook/url that a POST request can be sent to for sending, editing or deleting messages
-            - user_id: a Slack code that represents the invoking user's Display Name
-        */
-        const { response_url: responseUrl, user_id: userID } = req.body;
-        const text = generateBody(url, userID);
-        postToChannel(responseUrl, text);
+        switch(type){
+            case "shortcut":
+                const { trigger_id: triggerId } = JSON.parse(req.body.payload);
+                await openModal(triggerId);
+                break;
+            case "block_actions":
+                const { response_url: responseUrl, actions, channel, token, user} = JSON.parse(req.body.payload);
+
+                var responseUrlEscaped=responseUrl.replace(/\\\//g, "/");
+                switch(actions[0].action_id){
+                  case "cancel":
+                    await closeDialog(responseUrlEscaped);
+                    break;
+                  case "shuffle":
+                    const imgUrl =  await fetchStickers(actions[0].value);
+                    postToChannel(responseUrlEscaped, imgUrl, actions[0].value, true, true);
+                    break;
+                  case "send":
+                    const userProfile = await fetchProfile(user.id);
+                    await closeDialog(responseUrlEscaped);
+                    await postMessage(channel.id,actions[0].value,userProfile);
+                    break;
+                  default:
+                    return res.status(404).end();
+                }
+            default:
+              return res.status(404).end();
+        }
         return res.status(200).end();
     } catch (err) {
         console.log(err);
+        res.payload=err;
+        return res.status(503).end();
+    }
+});
+// Endpoint that sends media to Slack
+app.post('/get-gif', async (req, res) => {
+    try {
+        const { response_url: responseUrl, text : argument} = req.body;
+        const imgUrl = await fetchStickers(argument);
+        await postToChannel(responseUrl, imgUrl, argument, false, true);
+        return res.status(200).end();
+    } catch (err) {
+        console.log(err);
+        return res.status(503).end();
     }
 });
 
-const getUrls = () => ([
-    // urls where media files are hosted.
-    'https://gph.is/g/ZORBzKd',
-    'https://gph.is/g/ZnnlOBL',
-]);
 
-const postToChannel = async (responseUrl, text) => {
-    return fetch(responseUrl, {
+const closeDialog = async (responseUrl) => {
+    let data = {
+        delete_original: "true"
+    };
+    return await fetch(responseUrl, {
         method: 'POST',
-        /* Slack slash commands and apps generally expect a body with the following attributes:
-            - "text" (required) which is the data that would be sent to Slack
-            - "response_type": ephemeral/in_channel.
-
-               By default (i.e if not explicitly set), it is "ephemeral";
-               this means, the response from the command is visible to just the invoking user.
-
-               It can also be set to "in_channel" which means the response from the command is visible in whatever channel it is invoked.      
-        */
-        body: JSON.stringify({ text, response_type: 'in_channel' }),
+        body: JSON.stringify(data),
         headers: { 'Content-Type': 'application/json' },
     });
 }
 
-const generateBody = (url, userID) => {
-    /* Slack formats text in special ways:
-        For URLS: <https://paystack.com| paystack> returns a hyperlinked "paystack" text to https://paystack.com.
-        For Display Names: The user_id sent from the Slash command looks like this - Q016JVU6XFD
-        To get the display name, the ID has to be formatted: <@Q016JVU6XFD> would return @userxyz for example
-
-        Note: There is a user_name field but that can many times be different from the user's actual display name.
-    */
-    return `<${url}| good job> by <@${userID}>`
+const postToChannel = async (responseUrl, imgUrl, argument, replaceOriginal,ephemeral) => {
+    let data = {
+    blocks: [
+        {
+            type: "image",
+            title: {
+                type: "plain_text",
+                text: argument,
+                emoji: true
+            },
+            image_url: imgUrl,
+            alt_text: argument
+        },
+        {
+            type: "actions",
+            elements: [
+                {
+                    type: "button",
+                    text: {
+                        type: "plain_text",
+                        emoji: true,
+                        text: "Send"
+                    },
+                    style: "primary",
+                    action_id: "send",
+                    value: imgUrl
+                },
+                {
+                    type: "button",
+                    text: {
+                        type: "plain_text",
+                        emoji: true,
+                        text: "Shuffle"
+                    },
+                    action_id: "shuffle",
+                    value: argument
+                },
+                {
+                    type: "button",
+                    text: {
+                        type: "plain_text",
+                        emoji: true,
+                        text: "Cancel"
+                    },
+                    style: "danger",
+                    action_id: "cancel"
+                }
+            ]
+        }
+        ]
+    };
+    if(ephemeral){
+        data.response_type='ephemeral';
+    } else {
+        data.response_type='in_channel';
+    }
+    if(replaceOriginal){
+        data.replace_original="true";
+    }
+    return await fetch(responseUrl, {
+        method: 'POST',
+        body: JSON.stringify(data),
+        headers: { 'Content-Type': 'application/json' },
+    });
 }
+
+const openModal = async (triggerId) => {
+    const response = await fetch(`${slackApi}/views.open`, {
+      body: JSON.stringify({
+                            trigger_id: triggerId,
+                            view:{
+
+                               type: "modal",
+                               title: {
+                                    type: "plain_text",
+                                    text: "My App",
+                                    emoji: true
+                                },
+                                submit: {
+                                    type: "plain_text",
+                                    text: "Create"
+                                },
+                               blocks: [
+                                 {
+                                   block_id: "my_block_id",
+                                   type: "input",
+                                   optional: true,
+                                   label: {
+                                     type: "plain_text",
+                                     text: "Select a channel to post the result on",
+                                   },
+                                   element: {
+                                     action_id: "my_action_id",
+                                     type: "conversations_select",
+                                     response_url_enabled: true,
+                                     default_to_current_conversation: true,
+                                   },
+                                 },
+                               ]
+                             }
+                        }),
+      headers: {
+        Authorization: "Bearer "+process.env.AUTH_KEY,
+        "Content-Type": "application/json"
+      },
+      method: "POST"
+    });
+    console.log(response);
+    const data= await response.json();
+
+    console.log(data);
+
+    return;
+}
+
+const postMessage = async (channel, imgUrl, userProfile) => {
+    const response = await fetch(`${slackApi}/chat.postMessage`, {
+      body: JSON.stringify({
+              username: userProfile.real_name_normalized,
+              icon_url: userProfile.image_original,
+              channel: channel,
+              blocks: [
+                {
+                  type: 'image',
+                  title: {type: 'plain_text', text: 'Found on risibank'},
+                  image_url: imgUrl,
+                  alt_text: 'risibank'
+                }
+              ]
+            }),
+      headers: {
+        Authorization: "Bearer "+process.env.AUTH_KEY,
+        "Content-Type": "application/json"
+      },
+      method: "POST"
+    });
+    const data= await response.json();
+
+    return;
+}
+
+
+fetchStickers = async (argument) => {
+
+    const response = await fetch(`${risibankApi}/search?search=${argument}`, {
+      headers: {
+        Accept: "application/json, text/javascript, */*; q=0.01"
+      },
+      method: "POST"
+    });
+    const data= await response.json();
+
+    if(data.stickers && data.stickers.length>0){
+        const randomIndex = Math.floor(Math.random() * data.stickers.length);
+        return data.stickers[randomIndex].risibank_link;
+    }
+
+    return;
+}
+
+fetchProfile = async (userId) => {
+    const response = await fetch(`${slackApi}/users.profile.get?user=${userId}`, {
+      headers: {
+        Accept: "application/json, text/javascript, */*; q=0.01",
+        Authorization: "Bearer "+process.env.AUTH_KEY
+      },
+      method: "GET"
+    })
+
+    const data= await response.json();
+
+    if(data.profile){
+        return data.profile;
+    }
+
+    return;
+}
+
 
 app.listen(port, () => console.log(`App listening at ${process.env.HOST}:${port}`));
